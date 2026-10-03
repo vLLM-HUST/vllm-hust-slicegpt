@@ -1,0 +1,31 @@
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[project]
+name = "vllm-hust-slicegpt-toolkit"
+version = "0.1.0a1"
+description = "Offline SliceGPT calibration, slicing, and validated conversion"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT AND Apache-2.0"
+license-files = ["LICENSE", "LICENSE-MIT", "THIRD_PARTY_NOTICES.md"]
+dependencies = [
+  "vllm-hust-slicegpt==0.1.0a1",
+  "torch>=2.6,<2.12",
+  "transformers==4.41.0",
+  "accelerate==1.13.0",
+  "datasets==2.18.0",
+  "ml-collections==1.1.0",
+  "wandb==0.27.2",
+  "numpy<2",
+  "sentencepiece>=0.2",
+]
+
+[project.scripts]
+slicegpt-compress = "slicegpt_toolkit.run_slicegpt:main"
+slicegpt-convert-llama = "slicegpt_toolkit.convert_slicegpt_to_vllm:main"
+slicegpt-convert-qwen2 = "slicegpt_toolkit.convert_slicegpt_to_vllm_qwen2:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/slicegpt", "src/slicegpt_toolkit"]
