@@ -1,6 +1,6 @@
 # Pluginization acceptance and recovery
 
-Reference Manager: `52e96021c8017938b133ddba895795a13f707568`.
+Reference Manager: `98903e416bdb593186b8245fd95180dafde995b9`.
 ECPA 0.3 remains experimental; this project does not claim a stable ECPA v1 API.
 
 The Bundle entry point is a static module directory. The manifest and callable

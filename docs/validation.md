@@ -36,6 +36,10 @@ The Runtime wheel was installed in a fresh environment containing only it,
 safetensors, packaging, platformdirs and Manager `0.2.0.dev0`, built from
 `52e96021c8017938b133ddba895795a13f707568`. Neither torch nor vLLM was installed.
 
+The same clean-wheel lifecycle is now a Python 3.10/3.12 CI matrix pinned to
+Manager `98903e416bdb593186b8245fd95180dafde995b9`; this newer packaging check
+does not change the pending serving and observer gates below.
+
 `scripts/check_wheel.py` passed static discovery, inspect/validate/check/plan/render,
 disabled import, enable-intent/environment composition, unknown-host launch
 refusal, disable, explicit saved-configuration rollback and forget. Uninstall

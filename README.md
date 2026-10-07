@@ -44,7 +44,7 @@ Serving 环境先按照宿主构建说明安装上述固定 commit。需要匹�
 
 ```bash
 uv pip install --python .venv-serving/bin/python dist/vllm_hust_slicegpt-0.1.0a1-py3-none-any.whl
-uv pip install --python .venv-serving/bin/python 'vllm-hust-ext @ git+https://github.com/vLLM-HUST/extension-manager.git@52e96021c8017938b133ddba895795a13f707568'
+uv pip install --python .venv-serving/bin/python 'vllm-hust-ext @ git+https://github.com/vLLM-HUST/extension-manager.git@98903e416bdb593186b8245fd95180dafde995b9'
 ```
 
 这里 `.venv-serving` 表示已完成宿主安装的环境。

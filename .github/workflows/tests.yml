@@ -6,12 +6,15 @@ permissions:
   contents: read
 jobs:
   wheel:
+    strategy:
+      matrix:
+        python: ['3.10', '3.12']
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
+          python-version: ${{ matrix.python }}
       - run: python -m pip install uv
       - run: uv venv .venv
       - run: uv pip install --python .venv/bin/python build ruff
@@ -20,7 +23,7 @@ jobs:
       - run: .venv/bin/python -m build packages/runtime --outdir dist
       - run: .venv/bin/python -m build packages/toolkit --outdir dist
       - run: uv venv .venv-clean
-      - run: uv pip install --python .venv-clean/bin/python dist/vllm_hust_slicegpt-0.1.0a1-py3-none-any.whl 'vllm-hust-ext @ git+https://github.com/vLLM-HUST/extension-manager.git@52e96021c8017938b133ddba895795a13f707568'
+      - run: uv pip install --python .venv-clean/bin/python dist/vllm_hust_slicegpt-0.1.0a1-py3-none-any.whl 'vllm-hust-ext @ git+https://github.com/vLLM-HUST/extension-manager.git@98903e416bdb593186b8245fd95180dafde995b9'
       - run: .venv-clean/bin/python scripts/check_wheel.py
       - run: uv pip uninstall --python .venv-clean/bin/python vllm-hust-slicegpt
       - run: .venv-clean/bin/python -c 'import importlib.util; assert importlib.util.find_spec("vllm_hust_slicegpt") is None'
