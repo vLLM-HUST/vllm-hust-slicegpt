@@ -1,0 +1,25 @@
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[project]
+name = "vllm-hust-slicegpt"
+version = "0.1.0a1"
+description = "Explicitly activated SliceGPT model runtime and ECPA bundle"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "Apache-2.0"
+license-files = ["LICENSE", "LICENSE-MIT", "THIRD_PARTY_NOTICES.md"]
+dependencies = ["packaging>=24", "safetensors>=0.6.2"]
+
+[project.entry-points."vllm.general_plugins"]
+slicegpt = "vllm_hust_slicegpt.plugin:register"
+
+[project.entry-points."vllm_hust.extension_bundles"]
+"org.vllm-hust.slicegpt" = "vllm_hust_slicegpt.manifests"
+
+[project.scripts]
+slicegpt-artifact = "vllm_hust_slicegpt.artifact_cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/vllm_hust_slicegpt"]

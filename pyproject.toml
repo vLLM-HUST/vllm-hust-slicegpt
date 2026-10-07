@@ -1,0 +1,12 @@
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = ["toolkit: requires the isolated offline toolkit environment"]
+
+[tool.ruff]
+line-length = 88
+target-version = "py310"
+exclude = ["packages/toolkit/src/slicegpt"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+ignore = ["E501"]
