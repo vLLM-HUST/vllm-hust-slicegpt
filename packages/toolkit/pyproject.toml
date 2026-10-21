@@ -19,6 +19,8 @@ dependencies = [
   "ml-collections==1.1.0",
   "wandb==0.27.2",
   "numpy<2",
+  # Keep the legacy datasets/NumPy toolchain on a tested Arrow release.
+  "pyarrow==20.0.0",
   "sentencepiece>=0.2",
 ]
 

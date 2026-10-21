@@ -40,6 +40,7 @@ jobs:
       - run: uv venv .venv
       - run: uv pip install --python .venv/bin/python --index-url https://download.pytorch.org/whl/cpu torch==2.11.0
       - run: uv pip install --python .venv/bin/python ./packages/runtime ./packages/toolkit pytest
+      - run: uv pip check --python .venv/bin/python
       - run: .venv/bin/slicegpt-compress --help
       - run: .venv/bin/slicegpt-convert-llama --help
       - run: .venv/bin/slicegpt-convert-qwen2 --help
