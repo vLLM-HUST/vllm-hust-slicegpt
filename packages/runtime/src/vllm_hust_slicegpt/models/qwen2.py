@@ -239,6 +239,8 @@ class SliceGPTQwen2DecoderLayer(nn.Module):
         self.out_norm_eps = stock_rmsn_eps(mlp_out, orig_hidden, eps)
         self.register_buffer("mlp_norm_weight", torch.ones(mlp_in), persistent=False)
         self.register_buffer("out_norm_weight", torch.ones(mlp_out), persistent=False)
+        # Shortcut GEMM / block overlap uses CUDA streams; NPU runs sequentially.
+        self.overlap = current_platform.device_type == "cuda"
 
     def forward(
         self, positions: torch.Tensor, hidden_states: torch.Tensor
@@ -259,30 +261,53 @@ class SliceGPTQwen2DecoderLayer(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Take the normalized input and raw residual; return the same for the next
         layer (the last layer's output norm is the model's final norm)."""
-        main, side = torch.cuda.current_stream(), _side_stream()
-        side.wait_stream(main)
-        with torch.cuda.stream(side):
-            rotated = torch.matmul(residual, self.attn_shortcut_Q)
-        residual.record_stream(side)
-        hidden_states = self.self_attn(positions=positions, hidden_states=normed)
-        main.wait_stream(side)
-        rotated.record_stream(main)
-        residual = rotated
-        fused_add_rms_norm(
-            hidden_states, residual, self.mlp_norm_weight, self.mlp_norm_eps
+        rotated = self._rotate(residual, self.attn_shortcut_Q, positions, normed, True)
+        hidden_states, residual = fused_add_rms_norm(
+            self._block_out, rotated, self.mlp_norm_weight, self.mlp_norm_eps
         )
-        side.wait_stream(main)
-        with torch.cuda.stream(side):
-            rotated = torch.matmul(residual, self.mlp_shortcut_Q)
-        residual.record_stream(side)
-        hidden_states = self.mlp(hidden_states)
-        main.wait_stream(side)
-        rotated.record_stream(main)
-        residual = rotated
-        fused_add_rms_norm(
-            hidden_states, residual, self.out_norm_weight, self.out_norm_eps
+        rotated = self._rotate(
+            residual, self.mlp_shortcut_Q, positions, hidden_states, False
+        )
+        hidden_states, residual = fused_add_rms_norm(
+            self._block_out, rotated, self.out_norm_weight, self.out_norm_eps
         )
         return hidden_states, residual
+
+    def _rotate(
+        self,
+        residual: torch.Tensor,
+        shortcut_q: torch.Tensor,
+        positions: torch.Tensor,
+        block_in: torch.Tensor,
+        is_attn: bool,
+    ) -> torch.Tensor:
+        """Compute ``residual @ shortcut_q`` while the attention/MLP block runs.
+
+        On CUDA the rotation runs on a side stream, overlapping the block on the
+        main stream; on NPU both run sequentially. The block output is stashed on
+        ``self._block_out`` so the caller can feed it to the fused add+norm.
+        """
+        if self.overlap:
+            main, side = torch.cuda.current_stream(), _side_stream()
+            side.wait_stream(main)
+            with torch.cuda.stream(side):
+                rotated = torch.matmul(residual, shortcut_q)
+            residual.record_stream(side)
+            self._block_out = (
+                self.self_attn(positions=positions, hidden_states=block_in)
+                if is_attn
+                else self.mlp(block_in)
+            )
+            main.wait_stream(side)
+            rotated.record_stream(main)
+            return rotated
+        rotated = torch.matmul(residual, shortcut_q)
+        self._block_out = (
+            self.self_attn(positions=positions, hidden_states=block_in)
+            if is_attn
+            else self.mlp(block_in)
+        )
+        return rotated
 
 
 @support_torch_compile(
@@ -311,7 +336,7 @@ class SliceGPTQwen2Model(nn.Module):
         orig_hidden = config.slicegpt_artifact["original_hidden_size"]
         self.norm = SliceGPTRMSN(orig_hidden, eps=config.rms_norm_eps)
 
-        self.stock_norm = current_platform.device_type == "cuda"
+        self.stock_norm = current_platform.device_type in ("cuda", "npu")
         emb = sc["embedding_dim"]
         self.input_norm_eps = stock_rmsn_eps(emb, orig_hidden, config.rms_norm_eps)
         self.final_scale = stock_rmsn_scale(sc["final_norm_dim"], orig_hidden)

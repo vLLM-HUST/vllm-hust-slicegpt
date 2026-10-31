@@ -63,3 +63,52 @@ def test_cuda_rmsn_matches_eager(n_cols):
     torch.testing.assert_close(
         slicegpt_rmsn(x, 5120, 1e-6), reference_rmsn(torch, x, 5120, 1e-6)
     )
+
+
+def _npu_available(torch):
+    return hasattr(torch, "npu") and torch.npu.is_available()
+
+
+def test_npu_rms_norm_matches_eager():
+    torch = pytest.importorskip("torch")
+    if not _npu_available(torch):
+        pytest.skip("Ascend NPU required")
+    from vllm_hust_slicegpt.models.fused_ops import (
+        rms_norm,
+        stock_rmsn_eps,
+        stock_rmsn_scale,
+    )
+
+    x = torch.randn(48, 3840, device="npu", dtype=torch.float16) * 4
+    w = torch.ones(3840, device="npu", dtype=torch.float16)
+    got = rms_norm(x, w, stock_rmsn_eps(3840, 5120, 1e-6)) * stock_rmsn_scale(
+        3840, 5120
+    )
+    torch.testing.assert_close(
+        got, reference_rmsn(torch, x, 5120, 1e-6), atol=8e-3, rtol=0
+    )
+
+
+def test_npu_fused_add_rms_norm_matches_eager():
+    torch = pytest.importorskip("torch")
+    if not _npu_available(torch):
+        pytest.skip("Ascend NPU required")
+    from vllm_hust_slicegpt.models.fused_ops import (
+        fused_add_rms_norm,
+        stock_rmsn_eps,
+        stock_rmsn_scale,
+    )
+
+    attn = torch.randn(48, 3840, device="npu", dtype=torch.float16)
+    rotated = torch.randn(48, 3840, device="npu", dtype=torch.float16)
+    w = torch.ones(3840, device="npu", dtype=torch.float16)
+    normed, summed = fused_add_rms_norm(
+        attn, rotated, w, stock_rmsn_eps(3840, 5120, 1e-6)
+    )
+    torch.testing.assert_close(
+        normed * stock_rmsn_scale(3840, 5120),
+        reference_rmsn(torch, attn + rotated, 5120, 1e-6),
+        atol=8e-3,
+        rtol=0,
+    )
+    torch.testing.assert_close(summed, attn + rotated)

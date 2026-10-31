@@ -76,7 +76,16 @@ def stock_rmsn_scale(width: int, mean_dim: int) -> float:
     return (mean_dim / width) ** 0.5
 
 
+def stock_norm_available(x: torch.Tensor) -> bool:
+    """A fused host RMSNorm kernel exists for this tensor's device."""
+    return x.is_cuda or x.device.type == "npu"
+
+
 def rms_norm(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
+    if x.device.type == "npu":
+        import torch_npu
+
+        return torch_npu.npu_rms_norm(x, weight, eps)[0]
     from vllm import _custom_ops as ops
 
     out = torch.empty_like(x)
@@ -86,8 +95,19 @@ def rms_norm(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
 
 def fused_add_rms_norm(
     x: torch.Tensor, residual: torch.Tensor, weight: torch.Tensor, eps: float
-) -> None:
-    """In place: ``residual += x``; ``x = rms_norm(residual) * weight``."""
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return ``(rms_norm(x + residual) * weight, x + residual)``.
+
+    On CUDA this is in place (both returned tensors alias ``x`` and ``residual``);
+    on NPU ``torch_npu.npu_add_rms_norm`` returns fresh tensors. Callers must use
+    the returned handles rather than assuming ``x``/``residual`` were updated.
+    """
+    if x.device.type == "npu":
+        import torch_npu
+
+        normed, _, summed = torch_npu.npu_add_rms_norm(x, residual, weight, eps)
+        return normed, summed
     from vllm import _custom_ops as ops
 
     ops.fused_add_rms_norm(x, residual, weight, eps)
+    return x, residual
