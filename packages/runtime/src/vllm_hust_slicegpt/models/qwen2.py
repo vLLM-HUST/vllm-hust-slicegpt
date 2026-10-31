@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Inference-only SliceGPT-compressed Qwen2/Qwen2.5 model."""
 
+import os
 from collections.abc import Iterable
 
 import torch
@@ -336,7 +337,12 @@ class SliceGPTQwen2Model(nn.Module):
         orig_hidden = config.slicegpt_artifact["original_hidden_size"]
         self.norm = SliceGPTRMSN(orig_hidden, eps=config.rms_norm_eps)
 
-        self.stock_norm = current_platform.device_type in ("cuda", "npu")
+        # Fused host-kernel norm path (CUDA/NPU). SLICEGPT_EAGER_NORM=1 forces the
+        # portable eager SliceGPTRMSN path, for A/B comparison and as a fallback.
+        self.stock_norm = (
+            current_platform.device_type in ("cuda", "npu")
+            and os.environ.get("SLICEGPT_EAGER_NORM") != "1"
+        )
         emb = sc["embedding_dim"]
         self.input_norm_eps = stock_rmsn_eps(emb, orig_hidden, config.rms_norm_eps)
         self.final_scale = stock_rmsn_scale(sc["final_norm_dim"], orig_hidden)
