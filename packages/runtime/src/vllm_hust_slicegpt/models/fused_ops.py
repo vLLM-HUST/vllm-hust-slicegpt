@@ -58,3 +58,36 @@ def residual_project(
     if residual.dim() == 2 and residual.is_cuda:
         return torch.addmm(hidden_states, residual, shortcut_q)
     return torch.matmul(residual, shortcut_q) + hidden_states
+
+
+# SliceGPTRMSN divides by the original width D while x has width d. Since
+#   x * rsqrt(sum(x^2) / D + eps) = sqrt(D / d) * x * rsqrt(mean(x^2) + eps * D / d),
+# vLLM's C++ RMSNorm with unit weight and eps' = eps * D / d gives the same
+# normalized direction; the constant sqrt(D / d) is folded into the consuming
+# linear weights at load time. This also lets the post-rotation residual add use
+# fused_add_rms_norm.
+
+
+def stock_rmsn_eps(width: int, mean_dim: int, eps: float) -> float:
+    return eps * mean_dim / width
+
+
+def stock_rmsn_scale(width: int, mean_dim: int) -> float:
+    return (mean_dim / width) ** 0.5
+
+
+def rms_norm(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
+    from vllm import _custom_ops as ops
+
+    out = torch.empty_like(x)
+    ops.rms_norm(out, x, weight, eps)
+    return out
+
+
+def fused_add_rms_norm(
+    x: torch.Tensor, residual: torch.Tensor, weight: torch.Tensor, eps: float
+) -> None:
+    """In place: ``residual += x``; ``x = rms_norm(residual) * weight``."""
+    from vllm import _custom_ops as ops
+
+    ops.fused_add_rms_norm(x, residual, weight, eps)

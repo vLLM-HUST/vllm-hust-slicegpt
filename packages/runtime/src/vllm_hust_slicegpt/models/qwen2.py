@@ -37,9 +37,13 @@ from vllm.v1.attention.backend import AttentionType
 from vllm_hust_slicegpt.artifact import checked_weights, validate_config
 from vllm_hust_slicegpt.compatibility import check_backend, check_execution_config
 from vllm_hust_slicegpt.models.fused_ops import (
+    fused_add_rms_norm,
     fused_rmsn_available,
     residual_project,
+    rms_norm,
     slicegpt_rmsn,
+    stock_rmsn_eps,
+    stock_rmsn_scale,
 )
 from vllm_hust_slicegpt.models.rope import SliceGPTRotaryEmbedding
 
@@ -216,6 +220,16 @@ class SliceGPTQwen2DecoderLayer(nn.Module):
         self.attn_shortcut_Q = nn.Parameter(torch.empty(attn_in, attn_out))
         self.mlp_shortcut_Q = nn.Parameter(torch.empty(mlp_in, mlp_out))
 
+        # Stock-kernel path (CUDA): unit-weight norms; sqrt(D / d) is folded into
+        # qkv_proj / gate_up_proj by SliceGPTQwen2ForCausalLM.load_weights.
+        eps = config.rms_norm_eps
+        self.attn_input_scale = stock_rmsn_scale(attn_in, orig_hidden)
+        self.mlp_input_scale = stock_rmsn_scale(mlp_in, orig_hidden)
+        self.mlp_norm_eps = stock_rmsn_eps(mlp_in, orig_hidden, eps)
+        self.out_norm_eps = stock_rmsn_eps(mlp_out, orig_hidden, eps)
+        self.register_buffer("mlp_norm_weight", torch.ones(mlp_in), persistent=False)
+        self.register_buffer("out_norm_weight", torch.ones(mlp_out), persistent=False)
+
     def forward(
         self, positions: torch.Tensor, hidden_states: torch.Tensor
     ) -> torch.Tensor:
@@ -229,6 +243,23 @@ class SliceGPTQwen2DecoderLayer(nn.Module):
         hidden_states = self.mlp(hidden_states)
         hidden_states = residual_project(residual, self.mlp_shortcut_Q, hidden_states)
         return hidden_states
+
+    def forward_stock_norm(
+        self, positions: torch.Tensor, normed: torch.Tensor, residual: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Take the normalized input and raw residual; return the same for the next
+        layer (the last layer's output norm is the model's final norm)."""
+        hidden_states = self.self_attn(positions=positions, hidden_states=normed)
+        residual = torch.matmul(residual, self.attn_shortcut_Q)
+        fused_add_rms_norm(
+            hidden_states, residual, self.mlp_norm_weight, self.mlp_norm_eps
+        )
+        hidden_states = self.mlp(hidden_states)
+        residual = torch.matmul(residual, self.mlp_shortcut_Q)
+        fused_add_rms_norm(
+            hidden_states, residual, self.out_norm_weight, self.out_norm_eps
+        )
+        return hidden_states, residual
 
 
 @support_torch_compile(
@@ -257,6 +288,12 @@ class SliceGPTQwen2Model(nn.Module):
         orig_hidden = config.slicegpt_artifact["original_hidden_size"]
         self.norm = SliceGPTRMSN(orig_hidden, eps=config.rms_norm_eps)
 
+        self.stock_norm = current_platform.device_type == "cuda"
+        emb = sc["embedding_dim"]
+        self.input_norm_eps = stock_rmsn_eps(emb, orig_hidden, config.rms_norm_eps)
+        self.final_scale = stock_rmsn_scale(sc["final_norm_dim"], orig_hidden)
+        self.register_buffer("input_norm_weight", torch.ones(emb), persistent=False)
+
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
 
@@ -271,6 +308,16 @@ class SliceGPTQwen2Model(nn.Module):
             hidden_states = inputs_embeds
         else:
             hidden_states = self.embed_input_ids(input_ids)
+        if self.stock_norm:
+            residual = hidden_states
+            hidden_states = rms_norm(
+                residual, self.input_norm_weight, self.input_norm_eps
+            )
+            for layer in self.layers:
+                hidden_states, residual = layer.forward_stock_norm(
+                    positions, hidden_states, residual
+                )
+            return hidden_states
         for layer in self.layers:
             hidden_states = layer(positions, hidden_states)
         hidden_states = self.norm(hidden_states)
@@ -361,4 +408,20 @@ class SliceGPTQwen2ForCausalLM(nn.Module):
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, w)
                 loaded.add(name)
+        if self.model.stock_norm:
+            self._fold_norm_scales()
         return loaded
+
+    @torch.no_grad()
+    def _fold_norm_scales(self) -> None:
+        """Fold sqrt(D / d) of each unit-weight norm into the linear it feeds."""
+        if getattr(self, "_norm_scales_folded", False):
+            raise RuntimeError("SliceGPT norm scales are already folded")
+        for layer in self.model.layers:
+            layer.self_attn.qkv_proj.weight.mul_(layer.attn_input_scale)
+            layer.mlp.gate_up_proj.weight.mul_(layer.mlp_input_scale)
+        if self.model.final_scale != 1.0:
+            if self.config.tie_word_embeddings:
+                raise ValueError("Cannot fold the final norm scale into tied lm_head")
+            self.lm_head.weight.mul_(self.model.final_scale)
+        self._norm_scales_folded = True
