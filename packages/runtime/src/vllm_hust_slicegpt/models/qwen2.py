@@ -181,6 +181,16 @@ class SliceGPTQwen2Attention(nn.Module):
         return output
 
 
+_SIDE_STREAM: torch.cuda.Stream | None = None
+
+
+def _side_stream() -> torch.cuda.Stream:
+    global _SIDE_STREAM
+    if _SIDE_STREAM is None:
+        _SIDE_STREAM = torch.cuda.Stream()
+    return _SIDE_STREAM
+
+
 class SliceGPTQwen2DecoderLayer(nn.Module):
     def __init__(self, vllm_config: VllmConfig, prefix: str = "") -> None:
         super().__init__()
@@ -249,13 +259,26 @@ class SliceGPTQwen2DecoderLayer(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Take the normalized input and raw residual; return the same for the next
         layer (the last layer's output norm is the model's final norm)."""
+        main, side = torch.cuda.current_stream(), _side_stream()
+        side.wait_stream(main)
+        with torch.cuda.stream(side):
+            rotated = torch.matmul(residual, self.attn_shortcut_Q)
+        residual.record_stream(side)
         hidden_states = self.self_attn(positions=positions, hidden_states=normed)
-        residual = torch.matmul(residual, self.attn_shortcut_Q)
+        main.wait_stream(side)
+        rotated.record_stream(main)
+        residual = rotated
         fused_add_rms_norm(
             hidden_states, residual, self.mlp_norm_weight, self.mlp_norm_eps
         )
+        side.wait_stream(main)
+        with torch.cuda.stream(side):
+            rotated = torch.matmul(residual, self.mlp_shortcut_Q)
+        residual.record_stream(side)
         hidden_states = self.mlp(hidden_states)
-        residual = torch.matmul(residual, self.mlp_shortcut_Q)
+        main.wait_stream(side)
+        rotated.record_stream(main)
+        residual = rotated
         fused_add_rms_norm(
             hidden_states, residual, self.out_norm_weight, self.out_norm_eps
         )
