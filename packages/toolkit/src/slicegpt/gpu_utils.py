@@ -102,7 +102,7 @@ def distribute_model(model_adapter: ModelAdapter) -> None:
 def sync_gpus() -> None:
     """Sync all GPUs to make sure all operations are finished, needed for correct benchmarking of latency/throughput."""
     for i in range(torch.accelerator.device_count()):
-        torch.accelerator.synchronize(device=i)
+        torch.accelerator.synchronize(i)
 
 
 def benchmark(model_adapter: ModelAdapter, input_batch: torch.Tensor) -> dict:
