@@ -150,8 +150,13 @@ class SliceGPTQwen2Attention(nn.Module):
             rope_parameters=getattr(config, "rope_parameters", None),
             is_neox_style=True,
         )
+        # This model-local RoPE dispatches to the host's fused forward_oot (on NPU:
+        # AscendRotaryEmbedding, which only reads its own cos_sin_cache).
+        # SLICEGPT_NPU_NATIVE_ROPE=1 forces forward_native on NPU as a fallback.
         self.rotary_emb = SliceGPTRotaryEmbedding(
-            self.rotary_emb, native=current_platform.device_type == "npu"
+            self.rotary_emb,
+            native=current_platform.device_type == "npu"
+            and os.environ.get("SLICEGPT_NPU_NATIVE_ROPE") == "1",
         )
         attn_cls = (
             EncoderOnlyAttention

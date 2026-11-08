@@ -136,8 +136,10 @@ uv pip uninstall --python .venv-serving/bin/python vllm-hust-slicegpt
 ## Ascend 与运行证据
 
 Ascend 候选 `83a519c8e915938724369c6d6232d73a425a1034` 已更换旧 RoPE 路径。
-本包在 SliceGPT 自有 RoPE 对象上选择 `forward_native`，不修改宿主 platform、
-全局 RoPE 类或架构判断。NPU 入口要求 Ascend distribution version 包含该候选
+本包只在 SliceGPT 自有 RoPE 对象上做选择，不修改宿主 platform、全局 RoPE 类
+或架构判断：Qwen2 默认走宿主融合 `forward_oot`（NPU 上为 `AscendRotaryEmbedding`，
+只读自身 `cos_sin_cache`），`SLICEGPT_NPU_NATIVE_ROPE=1` 可退回 `forward_native`；
+Llama 仍为 `forward_native`。NPU 入口要求 Ascend distribution version 包含该候选
 commit 的干净 `g<sha>` 后缀；不可追溯的版本拒绝运行。仍须真实 NPU 验证。
 
 插件不自行发送 `runtime_effective`。当前 general-plugin loader 的
