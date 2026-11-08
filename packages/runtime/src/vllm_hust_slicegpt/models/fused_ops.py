@@ -54,7 +54,7 @@ def slicegpt_rmsn(x: torch.Tensor, mean_dim: int, eps: float) -> torch.Tensor:
 def residual_project(
     residual: torch.Tensor, shortcut_q: torch.Tensor, hidden_states: torch.Tensor
 ) -> torch.Tensor:
-    """``residual @ shortcut_q + hidden_states`` with the add fused into the GEMM."""
-    if residual.dim() == 2:
+    """Fuse the add on CUDA; preserve the eager path on other platforms."""
+    if residual.dim() == 2 and residual.is_cuda:
         return torch.addmm(hidden_states, residual, shortcut_q)
     return torch.matmul(residual, shortcut_q) + hidden_states

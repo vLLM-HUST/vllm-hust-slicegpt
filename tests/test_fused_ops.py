@@ -32,6 +32,24 @@ def test_residual_project_matches_matmul_add(shape):
     )
 
 
+def test_cpu_residual_project_does_not_use_cuda_addmm(monkeypatch):
+    torch = pytest.importorskip("torch")
+    from vllm_hust_slicegpt.models.fused_ops import residual_project
+
+    residual = torch.ones(2, 3)
+    shortcut = torch.ones(3, 4)
+    hidden = torch.ones(2, 4)
+
+    def reject_addmm(*args, **kwargs):
+        raise AssertionError("CPU/Ascend fallback must keep matmul + add")
+
+    monkeypatch.setattr(torch, "addmm", reject_addmm)
+    torch.testing.assert_close(
+        residual_project(residual, shortcut, hidden),
+        torch.matmul(residual, shortcut) + hidden,
+    )
+
+
 @pytest.mark.parametrize("n_cols", [3840, 5120])
 def test_cuda_rmsn_matches_eager(n_cols):
     torch = pytest.importorskip("torch")
