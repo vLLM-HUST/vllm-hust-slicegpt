@@ -62,11 +62,15 @@ def cleanup_memory() -> None:
     except (ValueError, KeyError):
         pass
 
+    # torch.accelerator memory APIs only exist in torch>=2.9; fall back to the
+    # device-specific module (torch.cuda / torch.npu) on older releases.
+    accel = torch.accelerator.current_accelerator() if torch.accelerator.is_available() else None
+    device_mod = getattr(torch, accel.type) if accel is not None else None
+    memory_reserved = getattr(torch.accelerator, "memory_reserved", None) or getattr(device_mod, "memory_reserved", None)
+    empty_cache = getattr(torch.accelerator, "empty_cache", None) or getattr(device_mod, "empty_cache", None)
+
     def total_reserved_mem() -> int:
-        return sum(
-            torch.accelerator.memory_reserved(device=i)
-            for i in range(torch.accelerator.device_count())
-        )
+        return sum(memory_reserved(i) for i in range(torch.accelerator.device_count()))
 
     memory_before = total_reserved_mem()
 
@@ -74,7 +78,7 @@ def cleanup_memory() -> None:
     gc.collect()
 
     if torch.accelerator.is_available():
-        torch.accelerator.empty_cache()
+        empty_cache()
         memory_after = total_reserved_mem()
         logging.debug(
             f"GPU memory{caller_name}: {memory_before / (1024**3):.2f} -> {memory_after / (1024**3):.2f} GB"
