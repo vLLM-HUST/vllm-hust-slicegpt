@@ -36,6 +36,11 @@ from vllm.v1.attention.backend import AttentionType
 
 from vllm_hust_slicegpt.artifact import checked_weights, validate_config
 from vllm_hust_slicegpt.compatibility import check_backend, check_execution_config
+from vllm_hust_slicegpt.models.fused_ops import (
+    fused_rmsn_available,
+    residual_project,
+    slicegpt_rmsn,
+)
 from vllm_hust_slicegpt.models.rope import SliceGPTRotaryEmbedding
 
 
@@ -46,6 +51,8 @@ class SliceGPTRMSN(nn.Module):
         self.eps = eps
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if fused_rmsn_available(x):
+            return slicegpt_rmsn(x, self.mean_dim, self.eps)
         orig_dtype = x.dtype
         x = x.to(torch.float32)
         variance = x.pow(2).sum(-1, keepdim=True) / self.mean_dim
@@ -215,12 +222,12 @@ class SliceGPTQwen2DecoderLayer(nn.Module):
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
         hidden_states = self.self_attn(positions=positions, hidden_states=hidden_states)
-        hidden_states = torch.matmul(residual, self.attn_shortcut_Q) + hidden_states
+        hidden_states = residual_project(residual, self.attn_shortcut_Q, hidden_states)
 
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
         hidden_states = self.mlp(hidden_states)
-        hidden_states = torch.matmul(residual, self.mlp_shortcut_Q) + hidden_states
+        hidden_states = residual_project(residual, self.mlp_shortcut_Q, hidden_states)
         return hidden_states
 
 
