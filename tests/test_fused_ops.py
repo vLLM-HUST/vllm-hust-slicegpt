@@ -179,3 +179,71 @@ def test_npu_fused_qk_rope_matches_neox_reference():
         .view(bs, -1)
     )
     torch.testing.assert_close(got, ref, atol=0, rtol=0)
+
+
+def test_stock_norm_scale_folding_matches_slicegpt_rmsn():
+    """Verify the math identity shared by both Qwen2 and Llama stock-norm paths."""
+    torch = pytest.importorskip("torch")
+    from vllm_hust_slicegpt.models.fused_ops import stock_rmsn_eps, stock_rmsn_scale
+
+    g = torch.Generator().manual_seed(7)
+    orig_hidden, sliced_dim, out_dim, eps = 64, 48, 32, 1e-6
+    x = torch.randn(11, sliced_dim, generator=g, dtype=torch.float64) * 3.0
+    w = torch.randn(out_dim, sliced_dim, generator=g, dtype=torch.float64)
+
+    # Eager SliceGPTRMSN followed by linear
+    eager_norm = x * torch.rsqrt(x.pow(2).sum(-1, keepdim=True) / orig_hidden + eps)
+    expected = torch.nn.functional.linear(eager_norm, w)
+
+    # Unit-weight stock RMSNorm (mean over sliced_dim with eps * D/d) + folded weight
+    eps_prime = stock_rmsn_eps(sliced_dim, orig_hidden, eps)
+    scale = stock_rmsn_scale(sliced_dim, orig_hidden)
+    stock_norm = x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + eps_prime)
+    got = torch.nn.functional.linear(stock_norm, w * scale)
+    torch.testing.assert_close(got, expected, atol=1e-12, rtol=1e-12)
+
+
+def test_pretranspose_nd_weight_ignores_non_npu():
+    torch = pytest.importorskip("torch")
+    from vllm_hust_slicegpt.models.fused_ops import pretranspose_nd_weight
+
+    p = torch.nn.Parameter(torch.randn(4, 6))
+    assert pretranspose_nd_weight(p) is None
+    assert tuple(p.shape) == (4, 6)
+
+
+def test_prepare_and_select_npu_shared_rope_cache_guards(monkeypatch):
+    from types import SimpleNamespace
+
+    torch = pytest.importorskip("torch")
+    from vllm_hust_slicegpt.models.fused_ops import (
+        prepare_npu_shared_rope_cache,
+        select_npu_rope_cos_sin,
+    )
+
+    # Non-NPU tensors must cleanly decline shared NPU table creation.
+    cache = torch.randn(16, 8)
+    rope = SimpleNamespace(
+        cos_sin_cache=cache, is_neox_style=True, rotary_dim=8, head_size=8
+    )
+    layers = [
+        SimpleNamespace(
+            self_attn=SimpleNamespace(rotary_emb=SimpleNamespace(embedding=rope))
+        )
+    ]
+    assert prepare_npu_shared_rope_cache(layers) == (None, None)
+
+    # Env opt-out toggles must disable even before checking device.
+    monkeypatch.setenv("SLICEGPT_NPU_HOST_ROPE", "1")
+    assert prepare_npu_shared_rope_cache(layers) == (None, None)
+    monkeypatch.delenv("SLICEGPT_NPU_HOST_ROPE")
+
+    # select_npu_rope_cos_sin reshapes 1D positions cleanly and skips 2D positions.
+    cos_full = torch.arange(32, dtype=torch.float32).view(4, 8)
+    sin_full = cos_full + 10.0
+    pos = torch.tensor([2, 0, 3], dtype=torch.int64)
+    cos, sin = select_npu_rope_cos_sin(cos_full, sin_full, pos)
+    assert tuple(cos.shape) == (1, 3, 1, 8)
+    assert tuple(sin.shape) == (1, 3, 1, 8)
+    torch.testing.assert_close(cos[0, :, 0, :], cos_full[pos])
+    assert select_npu_rope_cos_sin(cos_full, sin_full, pos.unsqueeze(0)) is None

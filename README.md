@@ -137,10 +137,10 @@ uv pip uninstall --python .venv-serving/bin/python vllm-hust-slicegpt
 
 Ascend 候选 `83a519c8e915938724369c6d6232d73a425a1034` 已更换旧 RoPE 路径。
 本包只在 SliceGPT 自有模块上做选择，不修改宿主 platform、全局 RoPE 类或架构判断：
-Qwen2 在 NPU 上默认启用共享 cos/sin 表的融合 Q+K `npu_rotary_mul`（`SLICEGPT_NPU_HOST_ROPE=1`
+Qwen2 与 Llama 在 NPU 上均默认启用共享 cos/sin 表的融合 Q+K `npu_rotary_mul`（`SLICEGPT_NPU_HOST_ROPE=1`
 可退回宿主 `AscendRotaryEmbedding` `forward_oot`，`SLICEGPT_NPU_NATIVE_ROPE=1` 可退回
 `forward_native`），并对 TP=1 未量化 ND 权重使用预转置直调 `torch.mm`/`torch.addmm`
-（`SLICEGPT_NPU_FAST_LINEAR=0` 可退回宿主 `Linear` 封装）；Llama 仍为 `forward_native`。
+（`SLICEGPT_NPU_FAST_LINEAR=0` 可退回宿主 `Linear` 封装）。
 NPU 入口要求 Ascend distribution version 包含该候选 commit 的干净 `g<sha>` 后缀；
 不可追溯的版本拒绝运行。仍须真实 NPU 验证。
 

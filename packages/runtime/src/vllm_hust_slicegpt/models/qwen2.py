@@ -38,34 +38,22 @@ from vllm.v1.attention.backend import AttentionType
 from vllm_hust_slicegpt.artifact import checked_weights, validate_config
 from vllm_hust_slicegpt.compatibility import check_backend, check_execution_config
 from vllm_hust_slicegpt.models.fused_ops import (
-    build_npu_rope_cos_sin,
+    cuda_side_stream,
     fused_add_rms_norm,
     fused_rmsn_available,
     npu_direct_linear,
     npu_fused_qk_rope,
     npu_swiglu,
+    prepare_npu_shared_rope_cache,
+    pretranspose_nd_weight,
     residual_project,
     rms_norm,
+    select_npu_rope_cos_sin,
     slicegpt_rmsn,
     stock_rmsn_eps,
     stock_rmsn_scale,
 )
 from vllm_hust_slicegpt.models.rope import SliceGPTRotaryEmbedding
-
-_ACL_FORMAT_ND = 2
-
-
-def _pretranspose_nd_weight(param: nn.Parameter) -> torch.Tensor | None:
-    """In-place transpose a 2D ND NPU weight to ``[in, out]`` for ``torch.mm``."""
-    import torch_npu
-
-    w = param.data
-    if w.device.type != "npu" or w.ndim != 2:
-        return None
-    if torch_npu.get_npu_format(w) != _ACL_FORMAT_ND:
-        return None
-    param.data = w.t().contiguous()
-    return param.data
 
 
 class SliceGPTRMSN(nn.Module):
@@ -113,10 +101,10 @@ class SliceGPTQwen2MLP(nn.Module):
     def enable_npu_fast_linear(self) -> None:
         if self._fast_linear:
             return
-        gu_t = _pretranspose_nd_weight(self.gate_up_proj.weight)
+        gu_t = pretranspose_nd_weight(self.gate_up_proj.weight)
         if gu_t is None:
             return
-        dn_t = _pretranspose_nd_weight(self.down_proj.weight)
+        dn_t = pretranspose_nd_weight(self.down_proj.weight)
         if dn_t is None:
             # Undo gate_up transpose if down_proj was not ND.
             self.gate_up_proj.weight.data = gu_t.t().contiguous()
@@ -224,10 +212,10 @@ class SliceGPTQwen2Attention(nn.Module):
     def enable_npu_fast_linear(self) -> None:
         if self._fast_linear:
             return
-        qkv_t = _pretranspose_nd_weight(self.qkv_proj.weight)
+        qkv_t = pretranspose_nd_weight(self.qkv_proj.weight)
         if qkv_t is None:
             return
-        o_t = _pretranspose_nd_weight(self.o_proj.weight)
+        o_t = pretranspose_nd_weight(self.o_proj.weight)
         if o_t is None:
             self.qkv_proj.weight.data = qkv_t.t().contiguous()
             return
@@ -261,16 +249,6 @@ class SliceGPTQwen2Attention(nn.Module):
             return npu_direct_linear(attn_output, self._o_w_t)
         output, _ = self.o_proj(attn_output)
         return output
-
-
-_SIDE_STREAM: torch.cuda.Stream | None = None
-
-
-def _side_stream() -> torch.cuda.Stream:
-    global _SIDE_STREAM
-    if _SIDE_STREAM is None:
-        _SIDE_STREAM = torch.cuda.Stream()
-    return _SIDE_STREAM
 
 
 class SliceGPTQwen2DecoderLayer(nn.Module):
@@ -389,7 +367,7 @@ class SliceGPTQwen2DecoderLayer(nn.Module):
         so the caller can feed it to the fused add+norm.
         """
         if self.overlap:
-            main, side = torch.cuda.current_stream(), _side_stream()
+            main, side = torch.cuda.current_stream(), cuda_side_stream()
             side.wait_stream(main)
             with torch.cuda.stream(side):
                 rotated = torch.matmul(residual, shortcut_q)
@@ -465,38 +443,9 @@ class SliceGPTQwen2Model(nn.Module):
         if os.environ.get("SLICEGPT_NPU_FAST_LINEAR") != "0":
             for layer in self.layers:
                 layer.enable_npu_fast_linear()
-        if (
+        self._npu_cos_full, self._npu_sin_full = prepare_npu_shared_rope_cache(
             self.layers
-            and os.environ.get("SLICEGPT_NPU_NATIVE_ROPE") != "1"
-            and os.environ.get("SLICEGPT_NPU_HOST_ROPE") != "1"
-        ):
-            ref_rope = self.layers[0].self_attn.rotary_emb.embedding
-            ref_cache = getattr(ref_rope, "cos_sin_cache", None)
-            if (
-                ref_cache is not None
-                and ref_cache.device.type == "npu"
-                and getattr(ref_rope, "is_neox_style", False)
-                and getattr(ref_rope, "rotary_dim", None)
-                == getattr(ref_rope, "head_size", None)
-                and ref_cache.shape[-1] == ref_rope.head_size
-                and all(
-                    (
-                        c := getattr(
-                            layer.self_attn.rotary_emb.embedding, "cos_sin_cache", None
-                        )
-                    )
-                    is ref_cache
-                    or (
-                        c is not None
-                        and c.shape == ref_cache.shape
-                        and torch.equal(c, ref_cache)
-                    )
-                    for layer in self.layers
-                )
-            ):
-                self._npu_cos_full, self._npu_sin_full = build_npu_rope_cos_sin(
-                    ref_cache
-                )
+        )
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
@@ -510,17 +459,9 @@ class SliceGPTQwen2Model(nn.Module):
     ) -> torch.Tensor:
         if self._npu_need_prepare:
             self._prepare_npu_fast_path()
-        rope_cos_sin = None
-        if self._npu_cos_full is not None and positions.ndim == 1:
-            n_tok = positions.shape[0]
-            head_dim = self._npu_cos_full.shape[-1]
-            cos = self._npu_cos_full.index_select(0, positions).view(
-                1, n_tok, 1, head_dim
-            )
-            sin = self._npu_sin_full.index_select(0, positions).view(
-                1, n_tok, 1, head_dim
-            )
-            rope_cos_sin = (cos, sin)
+        rope_cos_sin = select_npu_rope_cos_sin(
+            self._npu_cos_full, self._npu_sin_full, positions
+        )
         if inputs_embeds is not None:
             hidden_states = inputs_embeds
         else:

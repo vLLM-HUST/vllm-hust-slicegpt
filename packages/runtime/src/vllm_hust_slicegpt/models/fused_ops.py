@@ -1,6 +1,9 @@
-"""CUDA fast paths for SliceGPT-specific ops; other platforms keep the eager torch code."""
+"""CUDA and Ascend NPU fast paths for SliceGPT-specific ops; other platforms keep eager torch."""
+
+import os
 
 import torch
+from torch import nn
 
 try:
     import triton
@@ -166,3 +169,76 @@ def npu_direct_linear(
 
 def npu_swiglu(x: torch.Tensor) -> torch.Tensor:
     return _get_torch_npu().npu_swiglu(x)
+
+
+_ACL_FORMAT_ND = 2
+_CUDA_SIDE_STREAM: torch.cuda.Stream | None = None
+
+
+def cuda_side_stream() -> torch.cuda.Stream:
+    """Return a lazy process-wide CUDA side stream for shortcut GEMM overlap."""
+    global _CUDA_SIDE_STREAM
+    if _CUDA_SIDE_STREAM is None:
+        _CUDA_SIDE_STREAM = torch.cuda.Stream()
+    return _CUDA_SIDE_STREAM
+
+
+def pretranspose_nd_weight(param: nn.Parameter) -> torch.Tensor | None:
+    """In-place transpose a 2D ND NPU weight to ``[in, out]`` for ``torch.mm``."""
+    w = param.data
+    if w.device.type != "npu" or w.ndim != 2:
+        return None
+    if _get_torch_npu().get_npu_format(w) != _ACL_FORMAT_ND:
+        return None
+    param.data = w.t().contiguous()
+    return param.data
+
+
+def prepare_npu_shared_rope_cache(
+    layers: nn.ModuleList | list[nn.Module],
+) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+    """Build shared duplicated ``(cos_full, sin_full)`` tables when all layers
+    share an identical NeoX full-head-dim ``cos_sin_cache`` on NPU."""
+    if (
+        not layers
+        or os.environ.get("SLICEGPT_NPU_NATIVE_ROPE") == "1"
+        or os.environ.get("SLICEGPT_NPU_HOST_ROPE") == "1"
+    ):
+        return None, None
+    ref_rope = getattr(layers[0].self_attn.rotary_emb, "embedding", None)
+    ref_cache = getattr(ref_rope, "cos_sin_cache", None)
+    if (
+        ref_cache is None
+        or ref_cache.device.type != "npu"
+        or not getattr(ref_rope, "is_neox_style", False)
+        or getattr(ref_rope, "rotary_dim", None) != getattr(ref_rope, "head_size", None)
+        or ref_cache.shape[-1] != ref_rope.head_size
+    ):
+        return None, None
+    for layer in layers[1:]:
+        rope = getattr(layer.self_attn.rotary_emb, "embedding", None)
+        cache = getattr(rope, "cos_sin_cache", None)
+        if cache is ref_cache:
+            continue
+        if (
+            cache is None
+            or cache.shape != ref_cache.shape
+            or not torch.equal(cache, ref_cache)
+        ):
+            return None, None
+    return build_npu_rope_cos_sin(ref_cache)
+
+
+def select_npu_rope_cos_sin(
+    cos_full: torch.Tensor | None,
+    sin_full: torch.Tensor | None,
+    positions: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor] | None:
+    """Index shared NPU RoPE tables once per forward step."""
+    if cos_full is None or sin_full is None or positions.ndim != 1:
+        return None
+    n_tok = positions.shape[0]
+    head_dim = cos_full.shape[-1]
+    cos = cos_full.index_select(0, positions).view(1, n_tok, 1, head_dim)
+    sin = sin_full.index_select(0, positions).view(1, n_tok, 1, head_dim)
+    return cos, sin
