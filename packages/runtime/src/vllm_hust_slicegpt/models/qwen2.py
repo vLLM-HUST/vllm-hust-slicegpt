@@ -38,8 +38,12 @@ from vllm.v1.attention.backend import AttentionType
 from vllm_hust_slicegpt.artifact import checked_weights, validate_config
 from vllm_hust_slicegpt.compatibility import check_backend, check_execution_config
 from vllm_hust_slicegpt.models.fused_ops import (
+    build_npu_rope_cos_sin,
     fused_add_rms_norm,
     fused_rmsn_available,
+    npu_direct_linear,
+    npu_fused_qk_rope,
+    npu_swiglu,
     residual_project,
     rms_norm,
     slicegpt_rmsn,
@@ -47,6 +51,21 @@ from vllm_hust_slicegpt.models.fused_ops import (
     stock_rmsn_scale,
 )
 from vllm_hust_slicegpt.models.rope import SliceGPTRotaryEmbedding
+
+_ACL_FORMAT_ND = 2
+
+
+def _pretranspose_nd_weight(param: nn.Parameter) -> torch.Tensor | None:
+    """In-place transpose a 2D ND NPU weight to ``[in, out]`` for ``torch.mm``."""
+    import torch_npu
+
+    w = param.data
+    if w.device.type != "npu" or w.ndim != 2:
+        return None
+    if torch_npu.get_npu_format(w) != _ACL_FORMAT_ND:
+        return None
+    param.data = w.t().contiguous()
+    return param.data
 
 
 class SliceGPTRMSN(nn.Module):
@@ -87,8 +106,30 @@ class SliceGPTQwen2MLP(nn.Module):
             prefix=f"{prefix}.down_proj",
         )
         self.act_fn = SiluAndMul()
+        self._fast_linear = False
+        self._gu_w_t: torch.Tensor | None = None
+        self._dn_w_t: torch.Tensor | None = None
+
+    def enable_npu_fast_linear(self) -> None:
+        if self._fast_linear:
+            return
+        gu_t = _pretranspose_nd_weight(self.gate_up_proj.weight)
+        if gu_t is None:
+            return
+        dn_t = _pretranspose_nd_weight(self.down_proj.weight)
+        if dn_t is None:
+            # Undo gate_up transpose if down_proj was not ND.
+            self.gate_up_proj.weight.data = gu_t.t().contiguous()
+            return
+        self._gu_w_t = gu_t
+        self._dn_w_t = dn_t
+        self._fast_linear = True
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if self._fast_linear:
+            x = npu_direct_linear(x, self._gu_w_t)
+            x = npu_swiglu(x)
+            return npu_direct_linear(x, self._dn_w_t)
         x, _ = self.gate_up_proj(x)
         x = self.act_fn(x)
         x, _ = self.down_proj(x)
@@ -126,6 +167,8 @@ class SliceGPTQwen2Attention(nn.Module):
         self.head_dim = head_dim or config.hidden_size // self.total_num_heads
         self.q_size = self.num_heads * self.head_dim
         self.kv_size = self.num_kv_heads * self.head_dim
+        self.qk_size = self.q_size + self.kv_size
+        self.total_qk_heads = self.num_heads + self.num_kv_heads
         self.scaling = self.head_dim**-0.5
 
         self.qkv_proj = QKVParallelLinear(
@@ -173,16 +216,49 @@ class SliceGPTQwen2Attention(nn.Module):
             attn_type=attn_type,
             prefix=f"{prefix}.attn",
         )
+        self._fast_linear = False
+        self._qkv_w_t: torch.Tensor | None = None
+        self._qkv_bias: torch.Tensor | None = None
+        self._o_w_t: torch.Tensor | None = None
+
+    def enable_npu_fast_linear(self) -> None:
+        if self._fast_linear:
+            return
+        qkv_t = _pretranspose_nd_weight(self.qkv_proj.weight)
+        if qkv_t is None:
+            return
+        o_t = _pretranspose_nd_weight(self.o_proj.weight)
+        if o_t is None:
+            self.qkv_proj.weight.data = qkv_t.t().contiguous()
+            return
+        self._qkv_w_t = qkv_t
+        self._qkv_bias = (
+            self.qkv_proj.bias.data if self.qkv_proj.bias is not None else None
+        )
+        self._o_w_t = o_t
+        self._fast_linear = True
 
     def forward(
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
+        rope_cos_sin: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> torch.Tensor:
-        qkv, _ = self.qkv_proj(hidden_states)
-        q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
-        q, k = self.rotary_emb(positions, q, k)
+        if self._fast_linear:
+            qkv = npu_direct_linear(hidden_states, self._qkv_w_t, self._qkv_bias)
+        else:
+            qkv, _ = self.qkv_proj(hidden_states)
+        if rope_cos_sin is not None:
+            cos, sin = rope_cos_sin
+            qk, v = qkv.split([self.qk_size, self.kv_size], dim=-1)
+            qk = npu_fused_qk_rope(qk, cos, sin, self.total_qk_heads, self.head_dim)
+            q, k = qk.split([self.q_size, self.kv_size], dim=-1)
+        else:
+            q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+            q, k = self.rotary_emb(positions, q, k)
         attn_output = self.attn(q, k, v)
+        if self._fast_linear:
+            return npu_direct_linear(attn_output, self._o_w_t)
         output, _ = self.o_proj(attn_output)
         return output
 
@@ -248,12 +324,23 @@ class SliceGPTQwen2DecoderLayer(nn.Module):
         # Shortcut GEMM / block overlap uses CUDA streams; NPU runs sequentially.
         self.overlap = current_platform.device_type == "cuda"
 
+    def enable_npu_fast_linear(self) -> None:
+        self.self_attn.enable_npu_fast_linear()
+        self.mlp.enable_npu_fast_linear()
+
     def forward(
-        self, positions: torch.Tensor, hidden_states: torch.Tensor
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        rope_cos_sin: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> torch.Tensor:
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
-        hidden_states = self.self_attn(positions=positions, hidden_states=hidden_states)
+        hidden_states = self.self_attn(
+            positions=positions,
+            hidden_states=hidden_states,
+            rope_cos_sin=rope_cos_sin,
+        )
         hidden_states = residual_project(residual, self.attn_shortcut_Q, hidden_states)
 
         residual = hidden_states
@@ -263,16 +350,22 @@ class SliceGPTQwen2DecoderLayer(nn.Module):
         return hidden_states
 
     def forward_stock_norm(
-        self, positions: torch.Tensor, normed: torch.Tensor, residual: torch.Tensor
+        self,
+        positions: torch.Tensor,
+        normed: torch.Tensor,
+        residual: torch.Tensor,
+        rope_cos_sin: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Take the normalized input and raw residual; return the same for the next
         layer (the last layer's output norm is the model's final norm)."""
-        rotated = self._rotate(residual, self.attn_shortcut_Q, positions, normed, True)
+        rotated = self._rotate(
+            residual, self.attn_shortcut_Q, positions, normed, True, rope_cos_sin
+        )
         hidden_states, residual = fused_add_rms_norm(
             self._block_out, rotated, self.mlp_norm_weight, self.mlp_norm_eps
         )
         rotated = self._rotate(
-            residual, self.mlp_shortcut_Q, positions, hidden_states, False
+            residual, self.mlp_shortcut_Q, positions, hidden_states, False, None
         )
         hidden_states, residual = fused_add_rms_norm(
             self._block_out, rotated, self.out_norm_weight, self.out_norm_eps
@@ -286,12 +379,14 @@ class SliceGPTQwen2DecoderLayer(nn.Module):
         positions: torch.Tensor,
         block_in: torch.Tensor,
         is_attn: bool,
+        rope_cos_sin: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> torch.Tensor:
         """Compute ``residual @ shortcut_q`` while the attention/MLP block runs.
 
         On CUDA the rotation runs on a side stream, overlapping the block on the
-        main stream; on NPU both run sequentially. The block output is stashed on
-        ``self._block_out`` so the caller can feed it to the fused add+norm.
+        main stream; on NPU both run sequentially (cross-stream ACL event sync
+        regressed throughput on 910B2). Output is stashed on ``self._block_out``
+        so the caller can feed it to the fused add+norm.
         """
         if self.overlap:
             main, side = torch.cuda.current_stream(), _side_stream()
@@ -307,9 +402,17 @@ class SliceGPTQwen2DecoderLayer(nn.Module):
             main.wait_stream(side)
             rotated.record_stream(main)
             return rotated
-        rotated = torch.matmul(residual, shortcut_q)
+        rotated = (
+            torch.mm(residual, shortcut_q)
+            if residual.ndim == 2
+            else torch.matmul(residual, shortcut_q)
+        )
         self._block_out = (
-            self.self_attn(positions=positions, hidden_states=block_in)
+            self.self_attn(
+                positions=positions,
+                hidden_states=block_in,
+                rope_cos_sin=rope_cos_sin,
+            )
             if is_attn
             else self.mlp(block_in)
         )
@@ -352,6 +455,48 @@ class SliceGPTQwen2Model(nn.Module):
         self.input_norm_eps = stock_rmsn_eps(emb, orig_hidden, config.rms_norm_eps)
         self.final_scale = stock_rmsn_scale(sc["final_norm_dim"], orig_hidden)
         self.register_buffer("input_norm_weight", torch.ones(emb), persistent=False)
+        self._npu_need_prepare = current_platform.device_type == "npu"
+        self._npu_cos_full: torch.Tensor | None = None
+        self._npu_sin_full: torch.Tensor | None = None
+
+    def _prepare_npu_fast_path(self) -> None:
+        """One-time NPU setup after weights finish loading and post-processing."""
+        self._npu_need_prepare = False
+        if os.environ.get("SLICEGPT_NPU_FAST_LINEAR") != "0":
+            for layer in self.layers:
+                layer.enable_npu_fast_linear()
+        if (
+            self.layers
+            and os.environ.get("SLICEGPT_NPU_NATIVE_ROPE") != "1"
+            and os.environ.get("SLICEGPT_NPU_HOST_ROPE") != "1"
+        ):
+            ref_rope = self.layers[0].self_attn.rotary_emb.embedding
+            ref_cache = getattr(ref_rope, "cos_sin_cache", None)
+            if (
+                ref_cache is not None
+                and ref_cache.device.type == "npu"
+                and getattr(ref_rope, "is_neox_style", False)
+                and getattr(ref_rope, "rotary_dim", None)
+                == getattr(ref_rope, "head_size", None)
+                and ref_cache.shape[-1] == ref_rope.head_size
+                and all(
+                    (
+                        c := getattr(
+                            layer.self_attn.rotary_emb.embedding, "cos_sin_cache", None
+                        )
+                    )
+                    is ref_cache
+                    or (
+                        c is not None
+                        and c.shape == ref_cache.shape
+                        and torch.equal(c, ref_cache)
+                    )
+                    for layer in self.layers
+                )
+            ):
+                self._npu_cos_full, self._npu_sin_full = build_npu_rope_cos_sin(
+                    ref_cache
+                )
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
@@ -363,6 +508,19 @@ class SliceGPTQwen2Model(nn.Module):
         intermediate_tensors: IntermediateTensors | None = None,
         inputs_embeds: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        if self._npu_need_prepare:
+            self._prepare_npu_fast_path()
+        rope_cos_sin = None
+        if self._npu_cos_full is not None and positions.ndim == 1:
+            n_tok = positions.shape[0]
+            head_dim = self._npu_cos_full.shape[-1]
+            cos = self._npu_cos_full.index_select(0, positions).view(
+                1, n_tok, 1, head_dim
+            )
+            sin = self._npu_sin_full.index_select(0, positions).view(
+                1, n_tok, 1, head_dim
+            )
+            rope_cos_sin = (cos, sin)
         if inputs_embeds is not None:
             hidden_states = inputs_embeds
         else:
@@ -374,11 +532,11 @@ class SliceGPTQwen2Model(nn.Module):
             )
             for layer in self.layers:
                 hidden_states, residual = layer.forward_stock_norm(
-                    positions, hidden_states, residual
+                    positions, hidden_states, residual, rope_cos_sin
                 )
             return hidden_states
         for layer in self.layers:
-            hidden_states = layer(positions, hidden_states)
+            hidden_states = layer(positions, hidden_states, rope_cos_sin)
         hidden_states = self.norm(hidden_states)
         return hidden_states
 

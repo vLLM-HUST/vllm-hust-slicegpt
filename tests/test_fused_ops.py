@@ -112,3 +112,70 @@ def test_npu_fused_add_rms_norm_matches_eager():
         rtol=0,
     )
     torch.testing.assert_close(summed, attn + rotated)
+
+
+def test_build_npu_rope_cos_sin_expands_half_cache():
+    torch = pytest.importorskip("torch")
+    from vllm_hust_slicegpt.models.fused_ops import build_npu_rope_cos_sin
+
+    cos_h = torch.arange(12, dtype=torch.float32).view(3, 4)
+    sin_h = cos_h + 100.0
+    cos_full, sin_full = build_npu_rope_cos_sin(torch.cat((cos_h, sin_h), dim=-1))
+    torch.testing.assert_close(cos_full, torch.cat((cos_h, cos_h), dim=-1))
+    torch.testing.assert_close(sin_full, torch.cat((sin_h, sin_h), dim=-1))
+    assert cos_full.is_contiguous() and sin_full.is_contiguous()
+
+
+@pytest.mark.parametrize("shape", [(5, 6), (2, 3, 6)])
+@pytest.mark.parametrize("with_bias", [False, True])
+def test_npu_direct_linear_matches_f_linear(shape, with_bias):
+    torch = pytest.importorskip("torch")
+    from vllm_hust_slicegpt.models.fused_ops import npu_direct_linear
+
+    g = torch.Generator().manual_seed(1)
+    x = torch.randn(*shape, generator=g, dtype=torch.float64)
+    w = torch.randn(4, 6, generator=g, dtype=torch.float64)
+    bias = torch.randn(4, generator=g, dtype=torch.float64) if with_bias else None
+    got = npu_direct_linear(x, w.t().contiguous(), bias)
+    expected = torch.nn.functional.linear(x, w, bias)
+    torch.testing.assert_close(got, expected)
+
+
+def test_npu_fused_qk_rope_matches_neox_reference():
+    torch = pytest.importorskip("torch")
+    if not _npu_available(torch):
+        pytest.skip("Ascend NPU required")
+    from vllm_hust_slicegpt.models.fused_ops import (
+        build_npu_rope_cos_sin,
+        npu_fused_qk_rope,
+    )
+
+    bs, n_q, n_kv, head_dim = 17, 8, 2, 128
+    inv_freq = 1.0 / (
+        1000000.0 ** (torch.arange(0, head_dim, 2, dtype=torch.float32) / head_dim)
+    )
+    t = torch.arange(128, dtype=torch.float32)
+    freqs = torch.einsum("i,j->ij", t, inv_freq)
+    cos_h = freqs.cos().to(torch.float16).to("npu")
+    sin_h = freqs.sin().to(torch.float16).to("npu")
+    cos_full, sin_full = build_npu_rope_cos_sin(torch.cat((cos_h, sin_h), dim=-1))
+
+    pos = torch.randint(0, 128, (bs,), device="npu", dtype=torch.int64)
+    qkv = torch.randn(
+        bs, (n_q + 2 * n_kv) * head_dim, device="npu", dtype=torch.float16
+    )
+    qk, _ = qkv.split([(n_q + n_kv) * head_dim, n_kv * head_dim], dim=-1)
+    cos = cos_full.index_select(0, pos).view(1, bs, 1, head_dim)
+    sin = sin_full.index_select(0, pos).view(1, bs, 1, head_dim)
+    got = npu_fused_qk_rope(qk, cos, sin, n_q + n_kv, head_dim)
+
+    ch = cos_h.index_select(0, pos).unsqueeze(1).float()
+    sh = sin_h.index_select(0, pos).unsqueeze(1).float()
+    x = qk.view(bs, n_q + n_kv, head_dim).float()
+    x1, x2 = x.chunk(2, dim=-1)
+    ref = (
+        torch.cat((x1 * ch - x2 * sh, x2 * ch + x1 * sh), dim=-1)
+        .to(torch.float16)
+        .view(bs, -1)
+    )
+    torch.testing.assert_close(got, ref, atol=0, rtol=0)
