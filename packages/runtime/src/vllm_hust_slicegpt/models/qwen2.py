@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Inference-only SliceGPT-compressed Qwen2/Qwen2.5 model."""
 
+import os
 from collections.abc import Iterable
 
 import torch
@@ -37,9 +38,23 @@ from vllm.v1.attention.backend import AttentionType
 from vllm_hust_slicegpt.artifact import checked_weights, validate_config
 from vllm_hust_slicegpt.compatibility import check_backend, check_execution_config
 from vllm_hust_slicegpt.models.fused_ops import (
+    cuda_side_stream,
+    enable_npu_direct_attention,
+    fused_add_rms_norm,
     fused_rmsn_available,
+    npu_apply_qk_rope,
+    npu_direct_linear,
+    npu_fused_qk_rope,
+    npu_swiglu,
+    prepare_npu_shared_rope_cache,
+    pretranspose_nd_weight,
+    pretranspose_split_qkv_nd_weight,
     residual_project,
+    rms_norm,
+    select_npu_rope_cos_sin,
     slicegpt_rmsn,
+    stock_rmsn_eps,
+    stock_rmsn_scale,
 )
 from vllm_hust_slicegpt.models.rope import SliceGPTRotaryEmbedding
 
@@ -82,8 +97,30 @@ class SliceGPTQwen2MLP(nn.Module):
             prefix=f"{prefix}.down_proj",
         )
         self.act_fn = SiluAndMul()
+        self._fast_linear = False
+        self._gu_w_t: torch.Tensor | None = None
+        self._dn_w_t: torch.Tensor | None = None
+
+    def enable_npu_fast_linear(self) -> None:
+        if self._fast_linear:
+            return
+        gu_t = pretranspose_nd_weight(self.gate_up_proj.weight)
+        if gu_t is None:
+            return
+        dn_t = pretranspose_nd_weight(self.down_proj.weight)
+        if dn_t is None:
+            # Undo gate_up transpose if down_proj was not ND.
+            self.gate_up_proj.weight.data = gu_t.t().contiguous()
+            return
+        self._gu_w_t = gu_t
+        self._dn_w_t = dn_t
+        self._fast_linear = True
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if self._fast_linear:
+            x = npu_direct_linear(x, self._gu_w_t)
+            x = npu_swiglu(x)
+            return npu_direct_linear(x, self._dn_w_t)
         x, _ = self.gate_up_proj(x)
         x = self.act_fn(x)
         x, _ = self.down_proj(x)
@@ -121,6 +158,8 @@ class SliceGPTQwen2Attention(nn.Module):
         self.head_dim = head_dim or config.hidden_size // self.total_num_heads
         self.q_size = self.num_heads * self.head_dim
         self.kv_size = self.num_kv_heads * self.head_dim
+        self.qk_size = self.q_size + self.kv_size
+        self.total_qk_heads = self.num_heads + self.num_kv_heads
         self.scaling = self.head_dim**-0.5
 
         self.qkv_proj = QKVParallelLinear(
@@ -145,8 +184,13 @@ class SliceGPTQwen2Attention(nn.Module):
             rope_parameters=getattr(config, "rope_parameters", None),
             is_neox_style=True,
         )
+        # This model-local RoPE dispatches to the host's fused forward_oot (on NPU:
+        # AscendRotaryEmbedding, which only reads its own cos_sin_cache).
+        # SLICEGPT_NPU_NATIVE_ROPE=1 forces forward_native on NPU as a fallback.
         self.rotary_emb = SliceGPTRotaryEmbedding(
-            self.rotary_emb, native=current_platform.device_type == "npu"
+            self.rotary_emb,
+            native=current_platform.device_type == "npu"
+            and os.environ.get("SLICEGPT_NPU_NATIVE_ROPE") == "1",
         )
         attn_cls = (
             EncoderOnlyAttention
@@ -163,16 +207,85 @@ class SliceGPTQwen2Attention(nn.Module):
             attn_type=attn_type,
             prefix=f"{prefix}.attn",
         )
+        self._fast_linear = False
+        self._split_qkv = False
+        self._qkv_w_t: torch.Tensor | None = None
+        self._qkv_bias: torch.Tensor | None = None
+        self._q_w_t: torch.Tensor | None = None
+        self._k_w_t: torch.Tensor | None = None
+        self._v_w_t: torch.Tensor | None = None
+        self._q_bias: torch.Tensor | None = None
+        self._k_bias: torch.Tensor | None = None
+        self._v_bias: torch.Tensor | None = None
+        self._o_w_t: torch.Tensor | None = None
+
+    def enable_npu_fast_linear(self) -> None:
+        if self._fast_linear:
+            return
+        o_t = pretranspose_nd_weight(self.o_proj.weight)
+        if o_t is None:
+            return
+        if os.environ.get("SLICEGPT_NPU_SPLIT_QKV") != "0":
+            split = pretranspose_split_qkv_nd_weight(
+                self.qkv_proj.weight, self.qkv_proj.bias, self.q_size, self.kv_size
+            )
+            if split is not None:
+                (
+                    self._q_w_t,
+                    self._k_w_t,
+                    self._v_w_t,
+                    self._q_bias,
+                    self._k_bias,
+                    self._v_bias,
+                ) = split
+                self._o_w_t = o_t
+                self._split_qkv = True
+                self._fast_linear = True
+                return
+        qkv_t = pretranspose_nd_weight(self.qkv_proj.weight)
+        if qkv_t is None:
+            self.o_proj.weight.data = o_t.t().contiguous()
+            return
+        self._qkv_w_t = qkv_t
+        self._qkv_bias = (
+            self.qkv_proj.bias.data if self.qkv_proj.bias is not None else None
+        )
+        self._o_w_t = o_t
+        self._fast_linear = True
 
     def forward(
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
+        rope_cos_sin: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> torch.Tensor:
-        qkv, _ = self.qkv_proj(hidden_states)
-        q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
-        q, k = self.rotary_emb(positions, q, k)
+        if self._split_qkv:
+            q = npu_direct_linear(hidden_states, self._q_w_t, self._q_bias)
+            k = npu_direct_linear(hidden_states, self._k_w_t, self._k_bias)
+            v = npu_direct_linear(hidden_states, self._v_w_t, self._v_bias)
+            if rope_cos_sin is not None:
+                cos, sin = rope_cos_sin
+                q, k = npu_apply_qk_rope(
+                    q, k, cos, sin, self.num_heads, self.num_kv_heads, self.head_dim
+                )
+            else:
+                q, k = self.rotary_emb(positions, q, k)
+        else:
+            if self._fast_linear:
+                qkv = npu_direct_linear(hidden_states, self._qkv_w_t, self._qkv_bias)
+            else:
+                qkv, _ = self.qkv_proj(hidden_states)
+            if rope_cos_sin is not None:
+                cos, sin = rope_cos_sin
+                qk, v = qkv.split([self.qk_size, self.kv_size], dim=-1)
+                qk = npu_fused_qk_rope(qk, cos, sin, self.total_qk_heads, self.head_dim)
+                q, k = qk.split([self.q_size, self.kv_size], dim=-1)
+            else:
+                q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+                q, k = self.rotary_emb(positions, q, k)
         attn_output = self.attn(q, k, v)
+        if self._fast_linear:
+            return npu_direct_linear(attn_output, self._o_w_t)
         output, _ = self.o_proj(attn_output)
         return output
 
@@ -216,12 +329,35 @@ class SliceGPTQwen2DecoderLayer(nn.Module):
         self.attn_shortcut_Q = nn.Parameter(torch.empty(attn_in, attn_out))
         self.mlp_shortcut_Q = nn.Parameter(torch.empty(mlp_in, mlp_out))
 
+        # Stock-kernel path (CUDA): unit-weight norms; sqrt(D / d) is folded into
+        # qkv_proj / gate_up_proj by SliceGPTQwen2ForCausalLM.load_weights.
+        eps = config.rms_norm_eps
+        self.attn_input_scale = stock_rmsn_scale(attn_in, orig_hidden)
+        self.mlp_input_scale = stock_rmsn_scale(mlp_in, orig_hidden)
+        self.mlp_norm_eps = stock_rmsn_eps(mlp_in, orig_hidden, eps)
+        self.out_norm_eps = stock_rmsn_eps(mlp_out, orig_hidden, eps)
+        self.register_buffer("mlp_norm_weight", torch.ones(mlp_in), persistent=False)
+        self.register_buffer("out_norm_weight", torch.ones(mlp_out), persistent=False)
+        # Shortcut GEMM / block overlap uses CUDA streams; NPU runs sequentially.
+        self.overlap = current_platform.device_type == "cuda"
+
+    def enable_npu_fast_linear(self) -> None:
+        self.self_attn.enable_npu_fast_linear()
+        self.mlp.enable_npu_fast_linear()
+
     def forward(
-        self, positions: torch.Tensor, hidden_states: torch.Tensor
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        rope_cos_sin: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> torch.Tensor:
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
-        hidden_states = self.self_attn(positions=positions, hidden_states=hidden_states)
+        hidden_states = self.self_attn(
+            positions=positions,
+            hidden_states=hidden_states,
+            rope_cos_sin=rope_cos_sin,
+        )
         hidden_states = residual_project(residual, self.attn_shortcut_Q, hidden_states)
 
         residual = hidden_states
@@ -229,6 +365,75 @@ class SliceGPTQwen2DecoderLayer(nn.Module):
         hidden_states = self.mlp(hidden_states)
         hidden_states = residual_project(residual, self.mlp_shortcut_Q, hidden_states)
         return hidden_states
+
+    def forward_stock_norm(
+        self,
+        positions: torch.Tensor,
+        normed: torch.Tensor,
+        residual: torch.Tensor,
+        rope_cos_sin: tuple[torch.Tensor, torch.Tensor] | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Take the normalized input and raw residual; return the same for the next
+        layer (the last layer's output norm is the model's final norm)."""
+        rotated = self._rotate(
+            residual, self.attn_shortcut_Q, positions, normed, True, rope_cos_sin
+        )
+        hidden_states, residual = fused_add_rms_norm(
+            self._block_out, rotated, self.mlp_norm_weight, self.mlp_norm_eps
+        )
+        rotated = self._rotate(
+            residual, self.mlp_shortcut_Q, positions, hidden_states, False, None
+        )
+        hidden_states, residual = fused_add_rms_norm(
+            self._block_out, rotated, self.out_norm_weight, self.out_norm_eps
+        )
+        return hidden_states, residual
+
+    def _rotate(
+        self,
+        residual: torch.Tensor,
+        shortcut_q: torch.Tensor,
+        positions: torch.Tensor,
+        block_in: torch.Tensor,
+        is_attn: bool,
+        rope_cos_sin: tuple[torch.Tensor, torch.Tensor] | None = None,
+    ) -> torch.Tensor:
+        """Compute ``residual @ shortcut_q`` while the attention/MLP block runs.
+
+        On CUDA the rotation runs on a side stream, overlapping the block on the
+        main stream; on NPU both run sequentially (cross-stream ACL event sync
+        regressed throughput on 910B2). Output is stashed on ``self._block_out``
+        so the caller can feed it to the fused add+norm.
+        """
+        if self.overlap:
+            main, side = torch.cuda.current_stream(), cuda_side_stream()
+            side.wait_stream(main)
+            with torch.cuda.stream(side):
+                rotated = torch.matmul(residual, shortcut_q)
+            residual.record_stream(side)
+            self._block_out = (
+                self.self_attn(positions=positions, hidden_states=block_in)
+                if is_attn
+                else self.mlp(block_in)
+            )
+            main.wait_stream(side)
+            rotated.record_stream(main)
+            return rotated
+        rotated = (
+            torch.mm(residual, shortcut_q)
+            if residual.ndim == 2
+            else torch.matmul(residual, shortcut_q)
+        )
+        self._block_out = (
+            self.self_attn(
+                positions=positions,
+                hidden_states=block_in,
+                rope_cos_sin=rope_cos_sin,
+            )
+            if is_attn
+            else self.mlp(block_in)
+        )
+        return rotated
 
 
 @support_torch_compile(
@@ -257,6 +462,31 @@ class SliceGPTQwen2Model(nn.Module):
         orig_hidden = config.slicegpt_artifact["original_hidden_size"]
         self.norm = SliceGPTRMSN(orig_hidden, eps=config.rms_norm_eps)
 
+        # Fused host-kernel norm path (CUDA/NPU). SLICEGPT_EAGER_NORM=1 forces the
+        # portable eager SliceGPTRMSN path, for A/B comparison and as a fallback.
+        self.stock_norm = (
+            current_platform.device_type in ("cuda", "npu")
+            and os.environ.get("SLICEGPT_EAGER_NORM") != "1"
+        )
+        emb = sc["embedding_dim"]
+        self.input_norm_eps = stock_rmsn_eps(emb, orig_hidden, config.rms_norm_eps)
+        self.final_scale = stock_rmsn_scale(sc["final_norm_dim"], orig_hidden)
+        self.register_buffer("input_norm_weight", torch.ones(emb), persistent=False)
+        self._npu_need_prepare = current_platform.device_type == "npu"
+        self._npu_cos_full: torch.Tensor | None = None
+        self._npu_sin_full: torch.Tensor | None = None
+
+    def _prepare_npu_fast_path(self) -> None:
+        """One-time NPU setup after weights finish loading and post-processing."""
+        self._npu_need_prepare = False
+        if os.environ.get("SLICEGPT_NPU_FAST_LINEAR") != "0":
+            for layer in self.layers:
+                layer.enable_npu_fast_linear()
+        enable_npu_direct_attention(self.layers)
+        self._npu_cos_full, self._npu_sin_full = prepare_npu_shared_rope_cache(
+            self.layers
+        )
+
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
 
@@ -267,12 +497,27 @@ class SliceGPTQwen2Model(nn.Module):
         intermediate_tensors: IntermediateTensors | None = None,
         inputs_embeds: torch.Tensor | None = None,
     ) -> torch.Tensor:
+        if self._npu_need_prepare:
+            self._prepare_npu_fast_path()
+        rope_cos_sin = select_npu_rope_cos_sin(
+            self._npu_cos_full, self._npu_sin_full, positions
+        )
         if inputs_embeds is not None:
             hidden_states = inputs_embeds
         else:
             hidden_states = self.embed_input_ids(input_ids)
+        if self.stock_norm:
+            residual = hidden_states
+            hidden_states = rms_norm(
+                residual, self.input_norm_weight, self.input_norm_eps
+            )
+            for layer in self.layers:
+                hidden_states, residual = layer.forward_stock_norm(
+                    positions, hidden_states, residual, rope_cos_sin
+                )
+            return hidden_states
         for layer in self.layers:
-            hidden_states = layer(positions, hidden_states)
+            hidden_states = layer(positions, hidden_states, rope_cos_sin)
         hidden_states = self.norm(hidden_states)
         return hidden_states
 
@@ -361,4 +606,20 @@ class SliceGPTQwen2ForCausalLM(nn.Module):
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 weight_loader(param, w)
                 loaded.add(name)
+        if self.model.stock_norm:
+            self._fold_norm_scales()
         return loaded
+
+    @torch.no_grad()
+    def _fold_norm_scales(self) -> None:
+        """Fold sqrt(D / d) of each unit-weight norm into the linear it feeds."""
+        if getattr(self, "_norm_scales_folded", False):
+            raise RuntimeError("SliceGPT norm scales are already folded")
+        for layer in self.model.layers:
+            layer.self_attn.qkv_proj.weight.mul_(layer.attn_input_scale)
+            layer.mlp.gate_up_proj.weight.mul_(layer.mlp_input_scale)
+        if self.model.final_scale != 1.0:
+            if self.config.tie_word_embeddings:
+                raise ValueError("Cannot fold the final norm scale into tied lm_head")
+            self.lm_head.weight.mul_(self.model.final_scale)
+        self._norm_scales_folded = True
