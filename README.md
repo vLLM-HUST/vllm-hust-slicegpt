@@ -137,10 +137,12 @@ uv pip uninstall --python .venv-serving/bin/python vllm-hust-slicegpt
 
 Ascend 候选 `83a519c8e915938724369c6d6232d73a425a1034` 已更换旧 RoPE 路径。
 本包只在 SliceGPT 自有模块上做选择，不修改宿主 platform、全局 RoPE 类或架构判断：
-Qwen2 与 Llama 在 NPU 上均默认启用共享 cos/sin 表的融合 Q+K `npu_rotary_mul`（`SLICEGPT_NPU_HOST_ROPE=1`
-可退回宿主 `AscendRotaryEmbedding` `forward_oot`，`SLICEGPT_NPU_NATIVE_ROPE=1` 可退回
-`forward_native`），并对 TP=1 未量化 ND 权重使用预转置直调 `torch.mm`/`torch.addmm`
-（`SLICEGPT_NPU_FAST_LINEAR=0` 可退回宿主 `Linear` 封装）。
+Qwen2 与 Llama 在 NPU 上默认对 TP=1 未量化 ND 权重启用预转置直调 `torch.mm`/`torch.addmm`
+（`SLICEGPT_NPU_FAST_LINEAR=0` 可退回宿主 `Linear` 封装）、拆分 Q/K/V 预转置配合共享 cos/sin 表
+`npu_apply_rotary_pos_emb`（`SLICEGPT_NPU_SPLIT_QKV=0` 可退回合并 QKV + `npu_rotary_mul`；
+`SLICEGPT_NPU_HOST_ROPE=1` 可退回宿主 `AscendRotaryEmbedding` `forward_oot`，
+`SLICEGPT_NPU_NATIVE_ROPE=1` 可退回 `forward_native`），并在模型自有 eager `Attention` 实例上
+设置 `use_direct_call=True`（`SLICEGPT_NPU_DIRECT_ATTN=0` 可退回 custom-op 路径）。
 NPU 入口要求 Ascend distribution version 包含该候选 commit 的干净 `g<sha>` 后缀；
 不可追溯的版本拒绝运行。仍须真实 NPU 验证。
 

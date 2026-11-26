@@ -247,3 +247,30 @@ def test_prepare_and_select_npu_shared_rope_cache_guards(monkeypatch):
     assert tuple(sin.shape) == (1, 3, 1, 8)
     torch.testing.assert_close(cos[0, :, 0, :], cos_full[pos])
     assert select_npu_rope_cos_sin(cos_full, sin_full, pos.unsqueeze(0)) is None
+
+
+def test_enable_npu_direct_attention_respects_toggle(monkeypatch):
+    from types import SimpleNamespace
+
+    from vllm_hust_slicegpt.models.fused_ops import enable_npu_direct_attention
+
+    layer = SimpleNamespace(
+        self_attn=SimpleNamespace(attn=SimpleNamespace(use_direct_call=False))
+    )
+    monkeypatch.setenv("SLICEGPT_NPU_DIRECT_ATTN", "0")
+    enable_npu_direct_attention([layer])
+    assert layer.self_attn.attn.use_direct_call is False
+
+    monkeypatch.delenv("SLICEGPT_NPU_DIRECT_ATTN")
+    enable_npu_direct_attention([layer])
+    assert layer.self_attn.attn.use_direct_call is True
+
+
+def test_pretranspose_split_qkv_ignores_non_npu():
+    torch = pytest.importorskip("torch")
+    from vllm_hust_slicegpt.models.fused_ops import pretranspose_split_qkv_nd_weight
+
+    p = torch.nn.Parameter(torch.randn(10, 6))
+    b = torch.nn.Parameter(torch.randn(10))
+    assert pretranspose_split_qkv_nd_weight(p, b, 6, 2) is None
+    assert tuple(p.shape) == (10, 6)

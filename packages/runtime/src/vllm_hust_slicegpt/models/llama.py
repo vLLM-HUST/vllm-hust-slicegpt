@@ -58,13 +58,16 @@ from vllm_hust_slicegpt.artifact import checked_weights, validate_config
 from vllm_hust_slicegpt.compatibility import check_backend, check_execution_config
 from vllm_hust_slicegpt.models.fused_ops import (
     cuda_side_stream,
+    enable_npu_direct_attention,
     fused_add_rms_norm,
     fused_rmsn_available,
+    npu_apply_qk_rope,
     npu_direct_linear,
     npu_fused_qk_rope,
     npu_swiglu,
     prepare_npu_shared_rope_cache,
     pretranspose_nd_weight,
+    pretranspose_split_qkv_nd_weight,
     residual_project,
     rms_norm,
     select_npu_rope_cos_sin,
@@ -219,7 +222,11 @@ class SliceGPTDecoderLayer(nn.Module):
         self.overlap = current_platform.device_type == "cuda"
 
         self._attn_fast_linear = False
+        self._split_qkv = False
         self._qkv_w_t: torch.Tensor | None = None
+        self._q_w_t: torch.Tensor | None = None
+        self._k_w_t: torch.Tensor | None = None
+        self._v_w_t: torch.Tensor | None = None
         self._o_w_t: torch.Tensor | None = None
         self._qk_size = self.self_attn.q_size + self.self_attn.kv_size
         self._total_qk_heads = self.self_attn.num_heads + self.self_attn.num_kv_heads
@@ -228,12 +235,25 @@ class SliceGPTDecoderLayer(nn.Module):
         self.mlp.enable_npu_fast_linear()
         if self._attn_fast_linear:
             return
-        qkv_t = pretranspose_nd_weight(self.self_attn.qkv_proj.weight)
-        if qkv_t is None:
-            return
         o_t = pretranspose_nd_weight(self.self_attn.o_proj.weight)
         if o_t is None:
-            self.self_attn.qkv_proj.weight.data = qkv_t.t().contiguous()
+            return
+        if os.environ.get("SLICEGPT_NPU_SPLIT_QKV") != "0":
+            split = pretranspose_split_qkv_nd_weight(
+                self.self_attn.qkv_proj.weight,
+                self.self_attn.qkv_proj.bias,
+                self.self_attn.q_size,
+                self.self_attn.kv_size,
+            )
+            if split is not None:
+                self._q_w_t, self._k_w_t, self._v_w_t = split[:3]
+                self._o_w_t = o_t
+                self._split_qkv = True
+                self._attn_fast_linear = True
+                return
+        qkv_t = pretranspose_nd_weight(self.self_attn.qkv_proj.weight)
+        if qkv_t is None:
+            self.self_attn.o_proj.weight.data = o_t.t().contiguous()
             return
         self._qkv_w_t = qkv_t
         self._o_w_t = o_t
@@ -248,18 +268,32 @@ class SliceGPTDecoderLayer(nn.Module):
         if not self._attn_fast_linear and rope_cos_sin is None:
             return self.self_attn(positions=positions, hidden_states=hidden_states)
         attn = self.self_attn
-        if self._attn_fast_linear:
-            qkv = npu_direct_linear(hidden_states, self._qkv_w_t)
+        if self._split_qkv:
+            q = npu_direct_linear(hidden_states, self._q_w_t)
+            k = npu_direct_linear(hidden_states, self._k_w_t)
+            v = npu_direct_linear(hidden_states, self._v_w_t)
+            if rope_cos_sin is not None:
+                cos, sin = rope_cos_sin
+                q, k = npu_apply_qk_rope(
+                    q, k, cos, sin, attn.num_heads, attn.num_kv_heads, attn.head_dim
+                )
+            else:
+                q, k = attn.rotary_emb(positions, q, k)
         else:
-            qkv, _ = attn.qkv_proj(hidden_states)
-        if rope_cos_sin is not None:
-            cos, sin = rope_cos_sin
-            qk, v = qkv.split([self._qk_size, attn.kv_size], dim=-1)
-            qk = npu_fused_qk_rope(qk, cos, sin, self._total_qk_heads, attn.head_dim)
-            q, k = qk.split([attn.q_size, attn.kv_size], dim=-1)
-        else:
-            q, k, v = qkv.split([attn.q_size, attn.kv_size, attn.kv_size], dim=-1)
-            q, k = attn.rotary_emb(positions, q, k)
+            if self._attn_fast_linear:
+                qkv = npu_direct_linear(hidden_states, self._qkv_w_t)
+            else:
+                qkv, _ = attn.qkv_proj(hidden_states)
+            if rope_cos_sin is not None:
+                cos, sin = rope_cos_sin
+                qk, v = qkv.split([self._qk_size, attn.kv_size], dim=-1)
+                qk = npu_fused_qk_rope(
+                    qk, cos, sin, self._total_qk_heads, attn.head_dim
+                )
+                q, k = qk.split([attn.q_size, attn.kv_size], dim=-1)
+            else:
+                q, k, v = qkv.split([attn.q_size, attn.kv_size, attn.kv_size], dim=-1)
+                q, k = attn.rotary_emb(positions, q, k)
         attn_output = attn.attn(q, k, v)
         if self._attn_fast_linear:
             return npu_direct_linear(attn_output, self._o_w_t)
@@ -386,6 +420,7 @@ class SliceGPTLlamaModel(nn.Module):
         if os.environ.get("SLICEGPT_NPU_FAST_LINEAR") != "0":
             for layer in self.layers:
                 layer.enable_npu_fast_linear()
+        enable_npu_direct_attention(self.layers)
         self._npu_cos_full, self._npu_sin_full = prepare_npu_shared_rope_cache(
             self.layers
         )
