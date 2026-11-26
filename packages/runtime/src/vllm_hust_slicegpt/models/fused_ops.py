@@ -153,6 +153,26 @@ def npu_fused_qk_rope(
     return out.view(n_tok, qk.shape[1])
 
 
+def npu_apply_qk_rope(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    num_heads: int,
+    num_kv_heads: int,
+    head_dim: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Apply fused NeoX RoPE to already-contiguous Q and K in one CANN op."""
+    n_tok = q.shape[0]
+    q_out, k_out = _get_torch_npu().npu_apply_rotary_pos_emb(
+        q.view(1, n_tok, num_heads, head_dim),
+        k.view(1, n_tok, num_kv_heads, head_dim),
+        cos,
+        sin,
+    )
+    return q_out.view(n_tok, q.shape[1]), k_out.view(n_tok, k.shape[1])
+
+
 def npu_direct_linear(
     x: torch.Tensor,
     weight_t: torch.Tensor,
@@ -192,6 +212,58 @@ def pretranspose_nd_weight(param: nn.Parameter) -> torch.Tensor | None:
         return None
     param.data = w.t().contiguous()
     return param.data
+
+
+def pretranspose_split_qkv_nd_weight(
+    param: nn.Parameter,
+    bias: nn.Parameter | None,
+    q_size: int,
+    kv_size: int,
+) -> (
+    tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor | None,
+        torch.Tensor | None,
+        torch.Tensor | None,
+    ]
+    | None
+):
+    """Split a 2D ND NPU QKV weight into contiguous pre-transposed Q, K, V
+    weights (and optional biases), freeing the original storage for zero net HBM
+    increase so Q, K, V projections produce contiguous outputs directly."""
+    w = param.data
+    if w.device.type != "npu" or w.ndim != 2 or w.shape[0] != q_size + 2 * kv_size:
+        return None
+    if _get_torch_npu().get_npu_format(w) != _ACL_FORMAT_ND:
+        return None
+    q_end = q_size
+    k_end = q_size + kv_size
+    q_w_t = w[:q_end].t().contiguous()
+    k_w_t = w[q_end:k_end].t().contiguous()
+    v_w_t = w[k_end:].t().contiguous()
+    param.data = torch.empty(0, dtype=w.dtype, device=w.device)
+
+    q_b = k_b = v_b = None
+    if bias is not None:
+        b = bias.data
+        q_b = b[:q_end].contiguous()
+        k_b = b[q_end:k_end].contiguous()
+        v_b = b[k_end:].contiguous()
+        bias.data = torch.empty(0, dtype=b.dtype, device=b.device)
+    return q_w_t, k_w_t, v_w_t, q_b, k_b, v_b
+
+
+def enable_npu_direct_attention(layers: nn.ModuleList | list[nn.Module]) -> None:
+    """Bypass ``torch.ops.vllm.unified_attention_with_output`` custom-op boxing
+    on model-owned eager ``Attention`` instances on NPU."""
+    if os.environ.get("SLICEGPT_NPU_DIRECT_ATTN") == "0":
+        return
+    for layer in layers:
+        attn = getattr(layer.self_attn, "attn", None)
+        if attn is not None and hasattr(attn, "use_direct_call"):
+            attn.use_direct_call = True
 
 
 def prepare_npu_shared_rope_cache(
